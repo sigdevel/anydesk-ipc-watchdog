@@ -1,0 +1,8 @@
+[Unit]
+Description=Detect and auto-correct AnyDesk IPC failures
+After=network-online.target anydesk.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/anydesk-ipc-watchdog

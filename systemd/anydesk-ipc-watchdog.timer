@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AnyDesk IPC watchdog periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=anydesk-ipc-watchdog.service
+
+[Install]
+WantedBy=timers.target

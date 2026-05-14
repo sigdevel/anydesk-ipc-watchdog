@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TRACE_FILE="${TRACE_FILE:-/var/log/anydesk.trace}"
+STATE_DIR="${STATE_DIR:-/var/lib/anydesk-ipc-watchdog}"
+STATE_FILE="$STATE_DIR/last_line"
+COOLDOWN_FILE="$STATE_DIR/last_fix_epoch"
+LOG_TAG="${LOG_TAG:-anydesk-ipc-watchdog}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-300}"
+
+mkdir -p "$STATE_DIR"
+
+log() {
+  local msg="$1"
+  printf '%s\n' "$msg"
+  logger -t "$LOG_TAG" -- "$msg"
+}
+
+get_last_line() {
+  if [[ -f "$STATE_FILE" ]]; then
+    cat "$STATE_FILE"
+  else
+    printf '0\n'
+  fi
+}
+
+set_last_line() {
+  printf '%s\n' "$1" >"$STATE_FILE"
+}
+
+get_last_fix_epoch() {
+  if [[ -f "$COOLDOWN_FILE" ]]; then
+    cat "$COOLDOWN_FILE"
+  else
+    printf '0\n'
+  fi
+}
+
+set_last_fix_epoch() {
+  printf '%s\n' "$1" >"$COOLDOWN_FILE"
+}
+
+find_active_x11_session() {
+  local sid type state display uid
+  while read -r sid _; do
+    [[ -n "${sid:-}" ]] || continue
+    type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+    state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
+    display="$(loginctl show-session "$sid" -p Display --value 2>/dev/null || true)"
+    uid="$(loginctl show-session "$sid" -p User --value 2>/dev/null || true)"
+    if [[ "$type" == "x11" && "$state" == "active" && -n "$display" && -n "$uid" ]]; then
+      printf '%s %s %s\n' "$sid" "$uid" "$display"
+      return 0
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1, $3}')
+  return 1
+}
+
+ensure_tray() {
+  local sid uid display user home xauth dbus
+  if ! read -r sid uid display < <(find_active_x11_session); then
+    log "No active X11 session found; skipping tray restart."
+    return 0
+  fi
+
+  user="$(id -nu "$uid")"
+  home="$(getent passwd "$uid" | cut -d: -f6)"
+  xauth="$home/.Xauthority"
+  dbus="unix:path=/run/user/$uid/bus"
+
+  if pgrep -u "$uid" -f '/usr/bin/anydesk --tray' >/dev/null 2>&1; then
+    log "Tray already running for user $user on $display"
+    return 0
+  fi
+
+  if [[ ! -f "$xauth" ]]; then
+    log "Xauthority file not found for user $user at $xauth; skipping tray start"
+    return 0
+  fi
+
+  runuser -u "$user" -- env \
+    DISPLAY="$display" \
+    XAUTHORITY="$xauth" \
+    DBUS_SESSION_BUS_ADDRESS="$dbus" \
+    setsid /usr/bin/anydesk --tray >/dev/null 2>&1 < /dev/null &
+
+  sleep 2
+
+  if pgrep -u "$uid" -f '/usr/bin/anydesk --tray' >/dev/null 2>&1; then
+    log "Started tray for user $user on $display"
+  else
+    log "Failed to start tray for user $user on $display"
+  fi
+}
+
+cleanup_ipc_artifacts() {
+  find /tmp -maxdepth 1 \
+    \( \
+      -name 'ad_mailbox_*' -o \
+      -name 'ad_connect_queue_*' -o \
+      -name 'ad_gevt_*' -o \
+      -name 'ad_*gsystem_evt*' -o \
+      -name 'anydesk' \
+    \) \
+    -delete 2>/dev/null || true
+}
+
+remediate() {
+  local reason="$1"
+  local now
+  now="$(date +%s)"
+
+  if (( now - $(get_last_fix_epoch) < COOLDOWN_SECONDS )); then
+    log "Cooldown active; skipping remediation for: $reason"
+    return 0
+  fi
+
+  log "Remediation triggered: $reason"
+  set_last_fix_epoch "$now"
+
+  systemctl stop anydesk || true
+  pkill -f '/usr/bin/anydesk --tray' || true
+  pkill -f '/usr/bin/anydesk --backend' || true
+  cleanup_ipc_artifacts
+  systemctl start anydesk
+  sleep 3
+  ensure_tray
+
+  if systemctl is-active --quiet anydesk; then
+    log "AnyDesk remediation completed successfully"
+  else
+    log "AnyDesk remediation completed, but service is not active"
+    return 1
+  fi
+}
+
+scan_trace() {
+  local current last start_line new_lines trigger_lines
+
+  if [[ ! -f "$TRACE_FILE" ]]; then
+    log "Trace file not found: $TRACE_FILE"
+    return 0
+  fi
+
+  current="$(wc -l <"$TRACE_FILE")"
+  last="$(get_last_line)"
+
+  if [[ ! -f "$STATE_FILE" ]]; then
+    set_last_line "$current"
+    log "Initialized trace cursor at line $current"
+    return 0
+  fi
+
+  if [[ ! "$last" =~ ^[0-9]+$ ]]; then
+    last=0
+  fi
+
+  if (( current < last )); then
+    last=0
+  fi
+
+  if (( current == last )); then
+    return 0
+  fi
+
+  start_line=$((last + 1))
+  new_lines="$(sed -n "${start_line},${current}p" "$TRACE_FILE")"
+  set_last_line "$current"
+
+  trigger_lines="$(printf '%s\n' "$new_lines" | grep -E 'desk_rt_ipc_error|IPC timeout|IPC packet deserialization failed|Service connection lost|Zombie process detected' || true)"
+  if [[ -z "$trigger_lines" ]]; then
+    return 0
+  fi
+
+  remediate "$(printf '%s\n' "$trigger_lines" | tail -n 5 | tr '\n' '; ')"
+}
+
+main() {
+  case "${1:-}" in
+    --force-remediate)
+      remediate "manual force-remediate"
+      ;;
+    --reset-state)
+      rm -f "$STATE_FILE" "$COOLDOWN_FILE"
+      log "State reset."
+      ;;
+    "")
+      scan_trace
+      ;;
+    *)
+      printf 'Usage: %s [--force-remediate|--reset-state]\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "${1:-}"
