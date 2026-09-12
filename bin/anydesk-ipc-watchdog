@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TRACE_FILE="${TRACE_FILE:-/var/log/anydesk.trace}"
-STATE_DIR="${STATE_DIR:-/var/lib/anydesk-ipc-watchdog}"
+TRACE_FILE="/var/log/anydesk.trace"
+STATE_DIR="/var/lib/anydesk-ipc-watchdog"
 STATE_FILE="$STATE_DIR/last_line"
 COOLDOWN_FILE="$STATE_DIR/last_fix_epoch"
-LOG_TAG="${LOG_TAG:-anydesk-ipc-watchdog}"
-COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-300}"
+LOG_TAG="anydesk-ipc-watchdog"
+COOLDOWN_SECONDS=600
 
 mkdir -p "$STATE_DIR"
 
@@ -69,12 +69,12 @@ ensure_tray() {
   dbus="unix:path=/run/user/$uid/bus"
 
   if pgrep -u "$uid" -f '/usr/bin/anydesk --tray' >/dev/null 2>&1; then
-    log "Tray already running for user $user on $display"
+    log "Tray already running for user $user on $display."
     return 0
   fi
 
   if [[ ! -f "$xauth" ]]; then
-    log "Xauthority file not found for user $user at $xauth; skipping tray start"
+    log "Xauthority file not found for user $user at $xauth; skipping tray start."
     return 0
   fi
 
@@ -87,9 +87,9 @@ ensure_tray() {
   sleep 2
 
   if pgrep -u "$uid" -f '/usr/bin/anydesk --tray' >/dev/null 2>&1; then
-    log "Started tray for user $user on $display"
+    log "Started tray for user $user on $display."
   else
-    log "Failed to start tray for user $user on $display"
+    log "Failed to start tray for user $user on $display."
   fi
 }
 
@@ -127,9 +127,9 @@ remediate() {
   ensure_tray
 
   if systemctl is-active --quiet anydesk; then
-    log "AnyDesk remediation completed successfully"
+    log "AnyDesk remediation completed successfully."
   else
-    log "AnyDesk remediation completed, but service is not active"
+    log "AnyDesk remediation completed, but service is not active."
     return 1
   fi
 }
@@ -147,7 +147,7 @@ scan_trace() {
 
   if [[ ! -f "$STATE_FILE" ]]; then
     set_last_line "$current"
-    log "Initialized trace cursor at line $current"
+    log "Initialized trace cursor at line $current."
     return 0
   fi
 
@@ -167,7 +167,10 @@ scan_trace() {
   new_lines="$(sed -n "${start_line},${current}p" "$TRACE_FILE")"
   set_last_line "$current"
 
-  trigger_lines="$(printf '%s\n' "$new_lines" | grep -E 'desk_rt_ipc_error|IPC timeout|IPC packet deserialization failed|Service connection lost|Zombie process detected' || true)"
+  # Restart AnyDesk only on strong IPC/backend failures.  Do not restart on
+  # ordinary remote-side desk_rt_ipc_error or AnyDesk's own "Zombie process"
+  # cleanup messages: those were causing disruptive restarts during reconnects.
+  trigger_lines="$(printf '%s\n' "$new_lines" | grep -E 'IPC timeout|IPC packet deserialization failed|Service connection lost' || true)"
   if [[ -z "$trigger_lines" ]]; then
     return 0
   fi

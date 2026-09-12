@@ -1,6 +1,6 @@
 # AnyDesk IPC Watchdog
 
-`systemd` watchdog for Linux hosts where incoming AnyDesk sessions intermittently fail with `desk_rt_ipc_error`, `IPC timeout`, or related local IPC/backend failures.
+`systemd` watchdog for Linux hosts where incoming AnyDesk sessions intermittently fail with `IPC timeout` or related local IPC/backend failures.
 
 ## What It Does
 
@@ -15,7 +15,6 @@ On some Linux systems, incoming AnyDesk connections reach the host, but the loca
 
 - `app.session - IPC timeout`
 - `hub_ipc_socket - IPC packet deserialization failed`
-- `Zombie process detected`
 - `Service connection lost`
 
 The official AnyDesk guidance says `desk_rt_ipc_error` on Linux is commonly related to:
@@ -23,7 +22,7 @@ The official AnyDesk guidance says `desk_rt_ipc_error` on Linux is commonly rela
 - unsupported display server setups
 - DNS resolver issues
 
-This watchdog is aimed at the local AnyDesk stack getting stuck after those conditions or after long uptime.
+This watchdog is aimed at the local AnyDesk stack getting stuck after strong IPC/backend failures or after long uptime.
 
 ## Requirements
 
@@ -81,19 +80,19 @@ To reset the internal cursor/cooldown state:
 
 ## Detection Patterns
 
-The watchdog reacts to new log lines matching:
+The watchdog reacts to new log lines matching stronger IPC/backend failure signals:
 
-- `desk_rt_ipc_error`
 - `IPC timeout`
 - `IPC packet deserialization failed`
 - `Service connection lost`
-- `Zombie process detected`
+
+It intentionally does not restart AnyDesk on ordinary `desk_rt_ipc_error` or AnyDesk's own `Zombie process detected` cleanup messages, because those events can happen during reconnects and may make incoming sessions less stable if handled with an immediate restart.
 
 ## Default Behavior
 
 - Timer interval: `1 minute`
 - Boot delay: `2 minutes`
-- Remediation cooldown: `300 seconds`
+- Remediation cooldown: `600 seconds`
 - Trace file: `/var/log/anydesk.trace`
 - State directory: `/var/lib/anydesk-ipc-watchdog`
 
